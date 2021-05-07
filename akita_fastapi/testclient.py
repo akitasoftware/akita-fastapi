@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
+import uuid
 
 import akita_har.models as har
 import requests
@@ -42,16 +43,22 @@ def requests_to_har_entry(start: datetime, request: requests.Request, response: 
     prepared = request.prepare()
 
     url = parse.urlsplit(prepared.url)
-    query_string = [har.Record(name=k, value=v) for k, v in parse.parse_qs(url.query).items()]
 
+    query_string = [har.Record(name=k, value=v) for k, vs in parse.parse_qs(url.query).items() for v in vs]
     request_headers = [] if prepared.headers is None else [har.Record(name=k, value=v) for k, v in prepared.headers.items()]
     encoded_headers = '\n'.join([f'{k}: {v}' for k, v in request_headers]).encode("utf-8")
     body = None if prepared.body is None else prepared.body.decode("utf-7")
     cookies = [har.Record(name=cookie.name, value=cookie.value) for cookie in prepared._cookies]
 
+    # Clear the query from the URL in the HAR entry.  HAR entries record
+    # query parameters in a separate 'queryString' field.
+    # Also clear the URL fragment, which is excluded from HAR files:
+    # http://www.softwareishard.com/blog/har-12-spec/#request
+    har_entry_url = parse.urlunparse((url.scheme, url.netloc, url.path, '', '', ''))
+
     har_request = har.Request(
         method=prepared.method,
-        url=url.path,
+        url=har_entry_url,
         httpVersion=server_protocol,
         cookies=cookies,
         headers=request_headers,
@@ -77,19 +84,29 @@ def requests_to_har_entry(start: datetime, request: requests.Request, response: 
         bodySize=len(response_content),
     )
 
+    # datetime.timedelta doesn't have a total_milliseconds() method,
+    # so we compute it manually.
+    elapsed_time = (datetime.now(timezone.utc) - start) / timedelta(milliseconds=1)
+
     return har.Entry(
         startedDateTime=start,
-        time=(datetime.now(timezone.utc) - start).total_seconds(),
+        time=elapsed_time,
         request=har_request,
         response=har_response,
         cache=har.Cache(),
-        timings=har.Timings(send=0, wait=0, receive=0),
+        timings=har.Timings(send=0, wait=elapsed_time, receive=0),
     )
 
 
 class TestClient(FastAPITestClient):
-    def __init__(self, *args, har_file_path=f'akita_trace_{time.time()}.har', **kwargs):
-        self.har_writer = HarWriter(har_file_path, 'w')
+    def __init__(self, *args, har_file_path=None, **kwargs):
+        # Append 5 digits of a UUID to avoid clobbering the default file if
+        # many HAR clients are created in rapid succession.
+        tail = str(uuid.uuid4().int)[-5:]
+        now = datetime.now().strftime('%y%m%d_%H%M')
+        path = har_file_path if har_file_path is not None else f'akita_trace_{now}_{tail}.har'
+
+        self.har_writer = HarWriter(path, 'w')
         super().__init__(*args, **kwargs)
 
     def request(
